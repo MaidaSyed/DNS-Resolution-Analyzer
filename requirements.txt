@@ -1,5 +1,5 @@
-httpx[http2]
-h2
-pandas
-matplotlib
-pytest
+httpx[http2]>=0.27
+h2>=4.1
+pandas>=2.2
+matplotlib>=3.8
+pytest>=8.0
