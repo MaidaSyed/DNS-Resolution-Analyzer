@@ -1,0 +1,3 @@
+; Root hints for the private lab: the only root server is a.root. (10.10.3.10)
+.        3600000 IN NS a.root.
+a.root.  3600000 IN A  10.10.3.10
