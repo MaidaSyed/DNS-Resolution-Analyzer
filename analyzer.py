@@ -2,11 +2,12 @@
 """
 analyzer.py - Command-line entry point of the DNS Resolution Analyzer.
 
+  python analyzer.py iterative www.example.test
   python analyzer.py do53 www.example.test
   python analyzer.py dot  www.example.test --repeat 3
   python analyzer.py doh  www.example.test --repeat 3
 
-(`iterative` and `benchmark` are added in later batches.)
+(`benchmark` is added in a later batch.)
 Defaults point at the project's recursive resolver (10.10.2.53). For a quick
 check against a public resolver use e.g.:
   python analyzer.py dot www.example.com --server 1.1.1.1 --hostname one.one.one.one
@@ -22,6 +23,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "src"))
 
 from dns_analyzer.clients import Do53Client, DoHClient, DoTClient, QueryResult  # noqa: E402
 from dns_analyzer.dns import rcode_to_text, text_to_type  # noqa: E402
+from dns_analyzer.resolver import (DnsTransport, IterativeResolver, NameServer,  # noqa: E402
+                                   format_trace)
 
 DEFAULT_RESOLVER = "10.10.2.53"
 
@@ -56,6 +59,13 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--repeat", type=int, default=1,
                        help="send the query N times (shows connection reuse)")
 
+    p = sub.add_parser("iterative", help="our own iterative resolver (root -> TLD -> authoritative)")
+    common(p)
+    p.add_argument("--root", default="10.10.3.10", help="root server IP (root hints)")
+    p.add_argument("--port", type=int, default=53, help="UDP/TCP port of the DNS servers")
+    p.add_argument("--timeout", type=float, default=1.0, help="first retransmission timeout (s)")
+    p.add_argument("--attempts", type=int, default=3, help="UDP sends per query")
+
     p = sub.add_parser("do53", help="plain DNS over UDP/53 via a recursive resolver")
     common(p)
     p.add_argument("--server", default=DEFAULT_RESOLVER)
@@ -86,6 +96,16 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+
+    if args.mode == "iterative":
+        transport = DnsTransport(port=args.port, timeout=args.timeout, attempts=args.attempts)
+        resolver = IterativeResolver(transport, [NameServer("root-hint", args.root)])
+        failures = 0
+        for _ in range(args.repeat):
+            result = resolver.resolve(args.name, qtype)
+            print(format_trace(result))
+            failures += 0 if result.ok else 1
+        return 1 if failures else 0
 
     if args.mode == "do53":
         client = Do53Client(args.server, args.port, timeout=args.timeout)
