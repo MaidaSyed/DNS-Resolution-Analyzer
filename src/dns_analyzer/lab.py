@@ -97,15 +97,43 @@ def namespaces_exist() -> bool:
     return any(line.split()[0] == NAMESPACES["router"] for line in out.splitlines() if line.strip())
 
 
+def _lab_binary(tool: str, copy_name: str) -> str:
+    """
+    Ubuntu confines /usr/sbin/named and /usr/bin/tcpdump with AppArmor profiles
+    that attach to the program's PATH. A confined tcpdump cannot even be stopped
+    by us (kill -> 'Permission denied'). A copy stored under another name is not
+    confined, so the lab always runs its own copy (created once, needs root).
+    """
+    target = Path("/usr/local/sbin") / copy_name
+    if not target.exists():
+        source = shutil.which(tool) or f"/usr/sbin/{tool}"
+        if not Path(source).exists():
+            raise LabError(f"{tool} is not installed: sudo apt install bind9 bind9-utils tcpdump")
+        shutil.copy2(source, target)
+        os.chmod(target, 0o755)
+    return str(target)
+
+
 def named_binary() -> str:
-    """
-    Ubuntu confines /usr/sbin/named with AppArmor, which blocks reading our
-    project files. scripts/setup.sh makes an unconfined copy called named-lab.
-    """
-    for candidate in ("/usr/local/sbin/named-lab", "/usr/sbin/named"):
-        if Path(candidate).exists():
-            return candidate
-    raise LabError("BIND is not installed: sudo apt install bind9 bind9-utils")
+    return _lab_binary("named", "named-lab")
+
+
+def tcpdump_binary() -> str:
+    return _lab_binary("tcpdump", "tcpdump-lab")
+
+
+def _signal_all(sig: int) -> list[str]:
+    """Send `sig` to every process living in the lab namespaces; return pids we could not signal."""
+    failed: list[str] = []
+    for name in NAMESPACES.values():
+        for pid in _run(["ip", "netns", "pids", name], check=False).stdout.split():
+            try:
+                os.kill(int(pid), sig)
+            except ProcessLookupError:
+                pass
+            except (PermissionError, ValueError):
+                failed.append(pid)
+    return failed
 
 
 def up(verbose: bool = True) -> None:
@@ -161,10 +189,28 @@ def up(verbose: bool = True) -> None:
 
 def _render(template: Path, target: Path, rundir: Path) -> None:
     text = template.read_text()
-    for key, value in (("@RUNDIR@", rundir), ("@ZONEDIR@", ZONE_DIR),
-                       ("@CERTDIR@", CERT_DIR), ("@CONFDIR@", CONFIG_DIR)):
+    # All files BIND reads live inside its own run directory (see _stage_files).
+    for key, value in (("@RUNDIR@", rundir), ("@ZONEDIR@", rundir / "zones"),
+                       ("@CERTDIR@", rundir / "certs"), ("@CONFDIR@", rundir)):
         text = text.replace(key, str(value))
     target.write_text(text)
+
+
+def _stage_files(rundir: Path) -> None:
+    """
+    Copy the zone files, root hints and TLS key/certificate into BIND's run
+    directory (/tmp/dnslab/<node>). BIND drops most root privileges when it
+    starts, so it can NOT read files inside a private home folder such as
+    /home/you/Projects (Ubuntu home folders are mode 750) - it would fail with
+    'loading from master file ... permission denied'.
+    """
+    shutil.copytree(ZONE_DIR, rundir / "zones")
+    shutil.copy(CONFIG_DIR / "root.hints", rundir / "root.hints")
+    certs = rundir / "certs"
+    certs.mkdir()
+    for name in ("resolver.crt", "resolver.key"):
+        shutil.copy(CERT_DIR / name, certs / name)
+    os.chmod(certs / "resolver.key", 0o600)
 
 
 def _start_bind() -> None:
@@ -175,6 +221,7 @@ def _start_bind() -> None:
         rundir = RUN_DIR / node
         shutil.rmtree(rundir, ignore_errors=True)
         rundir.mkdir(parents=True)
+        _stage_files(rundir)
         if node == "resolver":
             _run(["rndc-confgen", "-a", "-k", "lab-key", "-c", str(rundir / "rndc.key")])
         conf = rundir / "named.conf"
@@ -216,21 +263,14 @@ def _tail(path: Path, lines: int = 8) -> str:
 # --------------------------------------------------------------- tear down --
 def down(quiet: bool = False) -> None:
     require_root()
-    for name in NAMESPACES.values():
-        pids = _run(["ip", "netns", "pids", name], check=False).stdout.split()
-        for pid in pids:
-            try:
-                os.kill(int(pid), signal.SIGTERM)
-            except (ProcessLookupError, ValueError):
-                pass
+    _signal_all(signal.SIGTERM)
     time.sleep(0.3)
+    stuck = _signal_all(signal.SIGKILL)
     for name in NAMESPACES.values():
-        for pid in _run(["ip", "netns", "pids", name], check=False).stdout.split():
-            try:
-                os.kill(int(pid), signal.SIGKILL)
-            except (ProcessLookupError, ValueError):
-                pass
         _run(["ip", "netns", "del", name], check=False)
+    if stuck and not quiet:
+        print(f"[lab] WARNING: could not stop process(es) {sorted(set(stuck))}: a security profile "
+              "(AppArmor) is protecting them. Reboot the VM once to clear them.")
     if not quiet:
         print("[lab] stopped; namespaces removed (logs kept in /tmp/dnslab)")
 
@@ -305,7 +345,7 @@ class Capture:
         # hand over/write every packet at once (otherwise libpcap buffers them for
         # about a second and a short capture would lose its last packets).
         self.proc = subprocess.Popen(
-            in_ns("client", ["tcpdump", "-i", self.iface, "-n", "-U", "--immediate-mode",
+            in_ns("client", [tcpdump_binary(), "-i", self.iface, "-n", "-U", "--immediate-mode",
                              "-s", "0", "-Z", "root", "-w", str(self.path), "ip"]),
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         # The pcap file appears slightly BEFORE tcpdump is really listening, so
@@ -325,7 +365,12 @@ class Capture:
     def stop(self) -> Path:
         if self.proc:
             time.sleep(0.4)                       # let the last packets arrive
-            self.proc.send_signal(signal.SIGINT)
+            try:
+                self.proc.send_signal(signal.SIGINT)
+            except PermissionError as exc:
+                self.proc = None
+                raise LabError("cannot stop tcpdump (permission denied, AppArmor?): reboot the VM "
+                               "once, then run again") from exc
             try:
                 self.proc.communicate(timeout=5)       # also drains stderr
             except subprocess.TimeoutExpired:

@@ -8,3 +8,8 @@ certs/
 *.pem
 __pycache__/
 .pytest_cache/
+certs/
+*.key
+*.pem
+__pycache__/
+.pytest_cache/

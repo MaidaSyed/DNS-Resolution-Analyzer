@@ -28,6 +28,7 @@ import argparse
 import os
 import pathlib
 import sys
+import traceback
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "src"))
 
@@ -210,7 +211,14 @@ def main(argv: list[str] | None = None) -> int:
             hand_back_ownership(args.out)
             return 0
     except (labmod.LabError, OSError, ValueError) as exc:
+        if os.environ.get("DNS_DEBUG"):
+            raise                      # DNS_DEBUG=1 shows the full Python traceback
         print(f"error: {exc}", file=sys.stderr)
+        if not isinstance(exc, labmod.LabError):
+            # Unexpected system errors: show WHERE it happened so it can be diagnosed.
+            frame = traceback.extract_tb(exc.__traceback__)[-1]
+            print(f"  (raised at {pathlib.Path(frame.filename).name}:{frame.lineno} "
+                  f"in {frame.name}(): {frame.line})", file=sys.stderr)
         return 2
 
     try:
